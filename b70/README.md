@@ -50,6 +50,11 @@ top-512 overlap 512/512 on all 11 indexer layers), and the needle passes at 7k, 
 not affected: its ragged path gathers keys and scales separately. Note that GLM-5.3's chat template has no
 `enable_thinking` switch; a thinking-off request needs the prompt rendered with an empty `<think></think>`.
 
+**Low-RAM mode (branch `b70-lowram`, not yet measured on the GPU):** `-e FTX_SRC=usm` makes the FTX CPU worker read
+the GPU expert store's USM host copy in place instead of building its own 114 GB copy. The experts then exist once in
+host RAM, about 145 GB peak in total, with outputs bit-identical to the default. Design, estimates and the GPU test plan:
+[`LOWRAM.md`](LOWRAM.md). The default (`FTX_SRC=ckpt`) is the measured configuration.
+
 Prefill is slow because the DPAS prefill MoE kernel is off for M < 256 (`GLM_MOE_PREFILL_MIN_M=256`) and prefill reads
 the experts zero-copy over PCIe. Decode is bound by expert misses.
 
@@ -97,6 +102,9 @@ Rebuilding them CPU-only in the base image on 2026-10-17 gave byte-identical fil
 | `_moe_glm_ftx.so` | `f7a219857eb9f86302325a898a53af29ccdb5a763154fb1af163e57b36f16115` | `kernels/moe-glm-ftx/build.sh` |
 | `_ftx.so` | `3c4200bebb1503bf3b41fd3eb5216caef02c12b31350936fc92bd14435d75b48` | `ftx/build_ftx.sh` step 1 (no per-kernel split) |
 | `ft_tier_host.so` | `ff2721979e4e435c4da824ffd5b3c5005e974f89d68f1f5473852c99fcb33862` | `ftx/build_ftx.sh` step 2 (`ftx_tier._build_host`) |
+
+On branch `b70-lowram` the FTX host sources gained the `FTX_SRC=usm` path, so `ft_tier_host.so` builds to a new hash.
+`_moe_glm_ftx.so` and `_ftx.so` are unchanged.
 
 The host extension is compiled with `-march=znver3` (AVX2/FMA/F16C), as measured. It runs on Zen 3 or newer. Other x86
 CPUs with AVX2 may hit an illegal instruction.

@@ -8,12 +8,21 @@ Per decode MoE call (M <= FTX_MAXM rows, not the MTP layer):
   y = store.forward_cached(key, x, ids2, w2)
   ftx.combine(y, ...)                    # bounded spin on the worker's done seq, y += fp32 partial
 
-The CPU copy of the experts is built from the checkpoint (native exllamav3 trellis layout) and re-laid out
-block-contiguous by tier_add_layer (swz=1): ~2.7 GB per layer.
+Expert source for the CPU worker (FTX_SRC):
+  ckpt (default, run G262-I0s800c1k): a CPU copy built from the checkpoint (native exllamav3 trellis layout) and re-laid
+       out block-contiguous by tier_add_layer (swz=1): ~2.7 GB per layer, 114 GB for the 42 layers, a second host copy
+       next to the GPU expert store's USM host copy.
+  usm  no copy: the worker reads the GPU expert store's USM host blobs in place (exl3xpu PLANAR4 blob layout, ft_core.h
+       layer_from_blobs), so every expert exists once in host RAM. I16 calls (every call where no expert has more than
+       2 tokens: all of C1) run as row bands over the blob rows, other calls as 128-output blocks; both are
+       bit-identical to the ckpt path (FTX_USM_KERN: 0 auto, 1 blocks only, 2 bands only = not bit-identical for AFFINE).
 
 Env: FTX=1 (enable), FTX_CPUS (default "4-23"), FTX_MAXM (4), FTX_TZC (0.40 ms per zero-copy miss), FTX_THIT (0.023),
      FTX_A (0.11), FTX_B (0.104), FTX_TOK (0.2), FTX_MAXN (32), FTX_FORCE_N (-1), FTX_MAX_SPIN (400000 polls),
-     FTX_MODE (-1 auto | 0 AFFINE | 1 EXACT | 2 I16), FTX_STATS_EVERY (2000 calls), FTX_VALIDATE (0)
+     FTX_MODE (-1 auto | 0 AFFINE | 1 EXACT | 2 I16), FTX_STATS_EVERY (2000 calls), FTX_SRC (ckpt | usm), FTX_USM_KERN (0),
+     FTX_VALIDATE (0; 1 = at init, compare the tier's layers bit for bit with today's ckpt path on random calls, see
+     validate()), FTX_VALIDATE_LAYERS (first,last FTX layer by model layer number), FTX_VALIDATE_NEXP (32),
+     FTX_VALIDATE_TRIALS (48), FTX_VALIDATE_STRICT (1: a mismatch turns the tier off)
 """
 import json, os, re, sys, time, threading
 import torch
@@ -81,10 +90,65 @@ def _layer_id(key):
     return int(m.group(1)) if m else None
 
 
+def _ckpt_layer(ck, L, E):
+    """Checkpoint tensors of model layer L's experts: (ptrs int64 [E, 3] native trellis addresses, fp16 scale dict,
+    the trellis tensors that must stay alive while ptrs are used)."""
+    pre = f"model.language_model.layers.{L}.mlp.experts."
+    tr, sc = [], {k: [] for k in ("suh_g", "svh_g", "suh_u", "svh_u", "suh_d", "svh_d")}
+    for e in range(E):
+        row = []
+        for pj, tag in (("gate_proj", "g"), ("up_proj", "u"), ("down_proj", "d")):
+            t = ck.get(f"{pre}{e}.{pj}.trellis").contiguous()
+            row.append(t)
+            sc["suh_" + tag].append(ck.get(f"{pre}{e}.{pj}.suh").to(torch.float16))
+            sc["svh_" + tag].append(ck.get(f"{pre}{e}.{pj}.svh").to(torch.float16))
+        tr.append(row)
+    ptrs = torch.tensor([[t.data_ptr() for t in row] for row in tr], dtype=torch.int64)
+    st = {k: torch.stack(v).contiguous() for k, v in sc.items()}
+    return ptrs, st, tr
+
+
+def validate(H, store, keys_l):
+    """FTX_VALIDATE=1: for the chosen layers, compare the tier's layer (as added: usm or ckpt) with today's ckpt path
+    (a swizzled copy of experts [0, FTX_VALIDATE_NEXP) built from the checkpoint) on random 1-4 token calls in every
+    mode, bit for bit, and time both at M = 1 with 8 picks. Returns True if every output was bit-identical."""
+    nexp = int(os.environ.get("FTX_VALIDATE_NEXP", "32"))
+    trials = int(os.environ.get("FTX_VALIDATE_TRIALS", "48"))
+    want = os.environ.get("FTX_VALIDATE_LAYERS", "")
+    ls = sorted(keys_l)
+    pick = [int(v) for v in want.split(",") if v.strip()] if want else sorted({ls[0], ls[-1]})
+    ck = _Ckpt(MODEL)
+    ok = True
+    for L in pick:
+        if L not in keys_l:
+            _log(f"validate: layer {L} is not an FTX layer, skipped"); continue
+        li = keys_l[L]
+        ptrs, st, tr = _ckpt_layer(ck, L, nexp)
+        t0 = time.time()
+        n, bad, maxd, maxr, ms_ref, ms_live = H.tier_validate(li, ptrs, st["suh_g"], st["svh_g"], st["suh_u"], st["svh_u"],
+                                                              st["suh_d"], st["svh_d"], nexp, trials, 1234 + L)
+        _log("validate", json.dumps({"layer": L, "src": os.environ.get("FTX_SRC", "ckpt"), "outputs": int(n),
+                                     "not_bit_identical": int(bad), "max_abs_diff": maxd, "max_abs_ref": round(maxr, 3),
+                                     "ms_per_expert_ckpt_swz": round(ms_ref, 4), "ms_per_expert_live": round(ms_live, 4),
+                                     "s": round(time.time() - t0, 1)}))
+        ok = ok and bad == 0
+        del ptrs, st, tr
+    ck.files.clear()
+    return ok
+
+
 def init(store):
     """Build the CPU tier for every MoE layer of this rank's store (called once, eager, before graph capture)."""
     t0 = time.time()
     H = _build_host()
+    src = os.environ.get("FTX_SRC", "ckpt")
+    if src not in ("ckpt", "usm"):
+        raise ValueError(f"FTX_SRC={src!r}: ckpt or usm")
+    usm = src == "usm"
+    if usm and int(getattr(store, "K", 3)) != 3:
+        raise ValueError(f"FTX_SRC=usm: the CPU kernels are K=3 only (store K={store.K})")
+    if usm and not hasattr(store, "host"):
+        raise ValueError("FTX_SRC=usm needs the USM expert store (EXL3_NVTIER=0)")
     torch.ops.load_library(os.path.join(_KDIR, "_ftx.so"))
     dev = store.dev
     E, Hd, I = store.E, store.H, store.I
@@ -103,30 +167,31 @@ def init(store):
     nl = len(keys)
     cpus = _cpus()
     H.tier_init(len(cpus), cpus, S["ctrl"], S["hx"], S["picks"], S["hout"], int(os.environ.get("FTX_MODE", "-1")),
-                Hd, I, nl, 1)
-    ck = _Ckpt(MODEL)
+                Hd, I, nl, 0 if usm else 1)
+    ck = None if usm else _Ckpt(MODEL)
+    kern = int(os.environ.get("FTX_USM_KERN", "0"))
     S["keys"] = set()
+    keys_l = {}
     for key in keys:
         li = store.layer_index[key]
         L = _layer_id(key)
         if L is None or key.startswith("mtp.") or "decoder" in key:
             _log("skip (GPU path):", key); continue
         S["keys"].add(key)
-        pre = f"model.language_model.layers.{L}.mlp.experts."
-        tr, sc = [], {k: [] for k in ("suh_g", "svh_g", "suh_u", "svh_u", "suh_d", "svh_d")}
-        for e in range(E):
-            row = []
-            for pj, tag in (("gate_proj", "g"), ("up_proj", "u"), ("down_proj", "d")):
-                t = ck.get(f"{pre}{e}.{pj}.trellis").contiguous()
-                row.append(t)
-                sc["suh_" + tag].append(ck.get(f"{pre}{e}.{pj}.suh").to(torch.float16))
-                sc["svh_" + tag].append(ck.get(f"{pre}{e}.{pj}.svh").to(torch.float16))
-            tr.append(row)
-        ptrs = torch.tensor([[t.data_ptr() for t in row] for row in tr], dtype=torch.int64)
-        st = {k: torch.stack(v).contiguous() for k, v in sc.items()}
+        keys_l[L] = li
+        if usm:
+            h = store.host[key]          # uint8 [E, blob] USM host memory, kept by the store for the server's lifetime
+            assert h.shape == (E, store.blob) and h.is_contiguous(), (tuple(h.shape), store.blob)
+            H.tier_add_layer_usm(li, h.data_ptr(), E, store.blob, kern)
+            continue
+        ptrs, st, tr = _ckpt_layer(ck, L, E)
         H.tier_add_layer(li, ptrs, st["suh_g"], st["svh_g"], st["suh_u"], st["svh_u"], st["suh_d"], st["svh_d"])
         del tr, ptrs   # tier_add_layer copied the trellis (swz); scales are kept by the extension
-    ck.files.clear()
+    if ck is not None:
+        ck.files.clear()
+    if os.environ.get("FTX_VALIDATE", "0") == "1":
+        if not validate(H, store, keys_l) and os.environ.get("FTX_VALIDATE_STRICT", "1") == "1":
+            raise RuntimeError("FTX_VALIDATE: the tier's outputs are not bit-identical to the ckpt path")
     g = lambda k, d: float(os.environ.get(k, d))
     S["pol"] = torch.tensor([g("FTX_TZC", 0.40), g("FTX_THIT", 0.023), g("FTX_A", 0.11), g("FTX_B", 0.104),
                              g("FTX_TOK", 0.2), g("FTX_MAXN", 32), g("FTX_FORCE_N", -1), 0.0], dtype=torch.float32, device=dev)
@@ -148,7 +213,8 @@ def init(store):
                 except Exception as e: _log("stats failed", repr(e)); return
         threading.Thread(target=_rep, daemon=True, name="ftx-stats").start()
     S["H"], S["store"], S["init"] = H, store, True
-    _log(f"pp{_pp_rank()} tier up: {len(S['keys'])}/{nl} layers, E={E}, cpus={cpus[0]}-{cpus[-1]} ({len(cpus)}), swz {H.tier_stats()[5] / 1e9:.1f} GB, "
+    _log(f"pp{_pp_rank()} tier up: {len(S['keys'])}/{nl} layers, E={E}, cpus={cpus[0]}-{cpus[-1]} ({len(cpus)}), src {src}"
+         f"{f' (kern {kern}, reads the USM store in place)' if usm else ''}, swz {H.tier_stats()[5] / 1e9:.1f} GB, "
          f"{time.time() - t0:.0f}s")
 
 

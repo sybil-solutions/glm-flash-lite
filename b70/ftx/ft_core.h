@@ -249,30 +249,75 @@ __attribute__((always_inline)) inline void tile_accum(const uint8_t* tile, const
 }
 
 // swz = 1: block-contiguous copy ([n/128][k/16][8 tiles]) so each work unit streams one contiguous run
-struct Mat { const uint8_t* tr; const uint16_t* suh; const uint16_t* svh; int k, n; int swz = 0; };
+// planar = 1: the exl3xpu GPU blob layout (PLANAR4 word order, see deplanar4), read in place; rs = byte stride of one
+// tile row (the gate and up matrices share rows in the blob: rs = 2 * n/16 * 96). swz and planar are exclusive.
+struct Mat { const uint8_t* tr; const uint16_t* suh; const uint16_t* svh; int k, n; int swz = 0; int planar = 0; size_t rs = 0; };
+
+// PLANAR4 (exl3xpu moe_offload.pack_expert / exl3_moe.n128.sycl, K = 3): within every tile row the tiles are grouped
+// by 4 along n and a group's 4 x 24 words are stored plane-major, word (tile t, period g, plane i) at [i][t][g],
+// instead of the checkpoint's tile-major [t][3g + i]. deplanar4 rebuilds the 4 checkpoint-order 96-byte tiles of one
+// group (384 B in, 384 B out), so tile_accum sees exactly the bytes it sees on the checkpoint copy.
+// Output word w = 3g + i of a tile comes from plane i, period g: per 8-word output vector v, every source plane is
+// permuted with the same index (8v + p) / 3 and the planes are blended by (8v + p) % 3.
+inline void deplanar4(const uint8_t* src, uint8_t* dst)
+{
+    const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
+    const __m256i i0 = _mm256_setr_epi32(0, 0, 0, 1, 1, 1, 2, 2);
+    const __m256i i1 = _mm256_setr_epi32(2, 3, 3, 3, 4, 4, 4, 5);
+    const __m256i i2 = _mm256_setr_epi32(5, 5, 6, 6, 6, 7, 7, 7);
+    #pragma GCC unroll 4
+    for (int t = 0; t < 4; ++t)
+    {
+        const __m256i A = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + t * 8));
+        const __m256i B = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 32 + t * 8));
+        const __m256i C = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(s + 64 + t * 8));
+        __m256i* o = reinterpret_cast<__m256i*>(dst + t * TILE_BYTES);
+        _mm256_storeu_si256(o + 0, _mm256_blend_epi32(_mm256_blend_epi32(_mm256_permutevar8x32_epi32(A, i0),
+            _mm256_permutevar8x32_epi32(B, i0), 0x92), _mm256_permutevar8x32_epi32(C, i0), 0x24));
+        _mm256_storeu_si256(o + 1, _mm256_blend_epi32(_mm256_blend_epi32(_mm256_permutevar8x32_epi32(A, i1),
+            _mm256_permutevar8x32_epi32(B, i1), 0x24), _mm256_permutevar8x32_epi32(C, i1), 0x49));
+        _mm256_storeu_si256(o + 2, _mm256_blend_epi32(_mm256_blend_epi32(_mm256_permutevar8x32_epi32(A, i2),
+            _mm256_permutevar8x32_epi32(B, i2), 0x49), _mm256_permutevar8x32_epi32(C, i2), 0x92));
+    }
+}
+
+// scalar reference of deplanar4 (tests)
+inline void deplanar4_ref(const uint8_t* src, uint8_t* dst)
+{
+    const uint32_t* s = reinterpret_cast<const uint32_t*>(src);
+    uint32_t* d = reinterpret_cast<uint32_t*>(dst);
+    for (int t = 0; t < 4; ++t)
+        for (int g = 0; g < 8; ++g)
+            for (int i = 0; i < 3; ++i) d[t * 24 + 3 * g + i] = s[i * 32 + t * 8 + g];
+}
 
 int PF_DIST = 6;
 
 // One 128-output block (8 tiles) of `mat` for M tokens. xp[i]: permuted activations of token i
 // ([k/16][32]); sumx[i]: sum of token i's transformed activations (AFFINE fixup). out[i*128 + ..]
-template <int M, bool EXACT>
+// PL: planar (exl3xpu blob) source; the 8 tiles of a block are 2 PLANAR4 groups = the same 768 contiguous bytes of a
+// tile row as on the checkpoint layout, so only the bytes inside them are reordered (deplanar4 into an L1 buffer).
+template <int M, bool EXACT, bool PL = false>
 void gemv_block(const Mat& mat, int blk, const float* const* xp, const float* sumx, float* out)
 {
     alignas(64) float acc[8][8 * M * 8];
     std::memset(acc, 0, sizeof(acc));
     const Consts K = consts();
     const int tiles_k = mat.k / 16, tiles_n = mat.n / 16;
-    const size_t row_stride = mat.swz ? size_t(8) * TILE_BYTES : size_t(tiles_n) * TILE_BYTES;
+    const size_t row_stride = PL ? mat.rs : mat.swz ? size_t(8) * TILE_BYTES : size_t(tiles_n) * TILE_BYTES;
     const uint8_t* p = mat.swz ? mat.tr + size_t(blk) * tiles_k * 8 * TILE_BYTES : mat.tr + size_t(blk) * 8 * TILE_BYTES;
     const float* X[M];
+    alignas(64) uint8_t tb[PL ? 8 * TILE_BYTES : 1];
     for (int tk = 0; tk < tiles_k; ++tk, p += row_stride)
     {
         const uint8_t* pf = p + PF_DIST * row_stride;
         #pragma GCC unroll 12
         for (int l = 0; l < 12; ++l) _mm_prefetch(reinterpret_cast<const char*>(pf) + l * 64, _MM_HINT_T0);
         for (int i = 0; i < M; ++i) X[i] = xp[i] + size_t(tk) * 32;
+        const uint8_t* q = p;
+        if constexpr (PL) { deplanar4(p, tb); deplanar4(p + 4 * TILE_BYTES, tb + 4 * TILE_BYTES); q = tb; }
         #pragma GCC unroll 1
-        for (int t = 0; t < 8; ++t) tile_accum<M, EXACT>(p + t * TILE_BYTES, X, acc[t], K);
+        for (int t = 0; t < 8; ++t) tile_accum<M, EXACT>(q + t * TILE_BYTES, X, acc[t], K);
     }
     for (int i = 0; i < M; ++i)
         for (int t = 0; t < 8; ++t)
@@ -289,6 +334,21 @@ void gemv_block(const Mat& mat, int blk, const float* const* xp, const float* su
 template <bool EXACT>
 void gemv_block_m(int m, const Mat& mat, int blk, const float* const* xp, const float* sumx, float* out)
 {
+    if (mat.planar)
+    {
+        switch (m)
+        {
+            case 1: gemv_block<1, EXACT, true>(mat, blk, xp, sumx, out); break;
+            case 2: gemv_block<2, EXACT, true>(mat, blk, xp, sumx, out); break;
+            case 3: gemv_block<3, EXACT, true>(mat, blk, xp, sumx, out); break;
+            case 4: gemv_block<4, EXACT, true>(mat, blk, xp, sumx, out); break;
+            case 5: gemv_block<5, EXACT, true>(mat, blk, xp, sumx, out); break;
+            case 6: gemv_block<6, EXACT, true>(mat, blk, xp, sumx, out); break;
+            case 7: gemv_block<7, EXACT, true>(mat, blk, xp, sumx, out); break;
+            default: gemv_block<8, EXACT, true>(mat, blk, xp, sumx, out); break;
+        }
+        return;
+    }
     switch (m)
     {
         case 1: gemv_block<1, EXACT>(mat, blk, xp, sumx, out); break;
@@ -328,7 +388,7 @@ __attribute__((always_inline)) inline void tile_accum_i16(const uint8_t* tile, c
     }
 }
 
-template <int M>
+template <int M, bool PL = false>
 void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const float* const* qs, const float* sumx, float* out)
 {
     alignas(64) int32_t acc[8][8 * M * 8];
@@ -337,17 +397,20 @@ void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const flo
     std::memset(accf, 0, sizeof(accf));
     const Consts K = consts();
     const int tiles_k = mat.k / 16, tiles_n = mat.n / 16;
-    const size_t row_stride = mat.swz ? size_t(8) * TILE_BYTES : size_t(tiles_n) * TILE_BYTES;
+    const size_t row_stride = PL ? mat.rs : mat.swz ? size_t(8) * TILE_BYTES : size_t(tiles_n) * TILE_BYTES;
     const uint8_t* p = mat.swz ? mat.tr + size_t(blk) * tiles_k * 8 * TILE_BYTES : mat.tr + size_t(blk) * 8 * TILE_BYTES;
     const int32_t* X[M];
+    alignas(64) uint8_t tb[PL ? 8 * TILE_BYTES : 1];
     for (int tk = 0; tk < tiles_k; ++tk, p += row_stride)
     {
         const uint8_t* pf = p + PF_DIST * row_stride;
         #pragma GCC unroll 12
         for (int l = 0; l < 12; ++l) _mm_prefetch(reinterpret_cast<const char*>(pf) + l * 64, _MM_HINT_T0);
         for (int i = 0; i < M; ++i) X[i] = xq[i] + size_t(tk) * 32;
+        const uint8_t* q = p;
+        if constexpr (PL) { deplanar4(p, tb); deplanar4(p + 4 * TILE_BYTES, tb + 4 * TILE_BYTES); q = tb; }
         #pragma GCC unroll 1
-        for (int t = 0; t < 8; ++t) tile_accum_i16<M>(p + t * TILE_BYTES, X, acc[t], K);
+        for (int t = 0; t < 8; ++t) tile_accum_i16<M>(q + t * TILE_BYTES, X, acc[t], K);
         if ((tk & 7) == 7)
         {
             for (int t = 0; t < 8; ++t)
@@ -374,6 +437,21 @@ void gemv_block_i16(const Mat& mat, int blk, const int32_t* const* xq, const flo
 
 void gemv_block_i16_m(int m, const Mat& mat, int blk, const int32_t* const* xq, const float* const* qs, const float* sumx, float* out)
 {
+    if (mat.planar)
+    {
+        switch (m)
+        {
+            case 1: gemv_block_i16<1, true>(mat, blk, xq, qs, sumx, out); break;
+            case 2: gemv_block_i16<2, true>(mat, blk, xq, qs, sumx, out); break;
+            case 3: gemv_block_i16<3, true>(mat, blk, xq, qs, sumx, out); break;
+            case 4: gemv_block_i16<4, true>(mat, blk, xq, qs, sumx, out); break;
+            case 5: gemv_block_i16<5, true>(mat, blk, xq, qs, sumx, out); break;
+            case 6: gemv_block_i16<6, true>(mat, blk, xq, qs, sumx, out); break;
+            case 7: gemv_block_i16<7, true>(mat, blk, xq, qs, sumx, out); break;
+            default: gemv_block_i16<8, true>(mat, blk, xq, qs, sumx, out); break;
+        }
+        return;
+    }
     switch (m)
     {
         case 1: gemv_block_i16<1>(mat, blk, xq, qs, sumx, out); break;
@@ -481,6 +559,37 @@ struct Layer
     std::vector<uint8_t*> blobs;
     int H = 4096, I = 2048;
 };
+
+// exl3xpu expert blob (moe_offload.pack_expert, exl3_moe.n128.sycl Geom), K = 3, no padding:
+//   gate|up trellis [H/16][2I/16 tiles] (per tile row: I/16 gate tiles, then I/16 up tiles), PLANAR4
+//   down trellis    [I/16][H/16 tiles], PLANAR4
+//   fp16            suh_g[H] suh_u[H] svh_g[I] svh_u[I] suh_d[I] svh_d[H]
+// For GLM-5.3-Flash (H 4096, I 2048) 9,474,048 B, the record size of the packed NVMe store as well.
+inline size_t blob_bytes_k3(int H, int I)
+{
+    return size_t(H / 16) * (2 * I / 16) * TILE_BYTES + size_t(I / 16) * (H / 16) * TILE_BYTES + size_t(3 * H + 3 * I) * 2;
+}
+
+// Point layer L at E blobs that start at `base`, `blob` bytes apart (the GPU expert store's USM host copy), in place:
+// no copy is made. Returns false if the geometry does not match a K = 3 blob.
+inline bool layer_from_blobs(Layer& L, const uint8_t* base, int E, size_t blob, int H, int I)
+{
+    if (blob != blob_bytes_k3(H, I) || (H / 16) % 4 || (I / 16) % 4 || H % 128 || I % 128) return false;
+    const size_t gu_rs = size_t(2 * I / 16) * TILE_BYTES, d_rs = size_t(H / 16) * TILE_BYTES;
+    const size_t gu = size_t(H / 16) * gu_rs, dn = size_t(I / 16) * d_rs;
+    L.H = H; L.I = I; L.ex.resize(E); L.blobs.clear();
+    for (int e = 0; e < E; ++e)
+    {
+        const uint8_t* b = base + size_t(e) * blob;
+        const uint16_t* sc = reinterpret_cast<const uint16_t*>(b + gu + dn);
+        const uint16_t *suh_g = sc, *suh_u = sc + H, *svh_g = sc + 2 * H, *svh_u = sc + 2 * H + I;
+        const uint16_t *suh_d = sc + 2 * H + 2 * I, *svh_d = sc + 2 * H + 3 * I;
+        L.ex[e].g = { b, suh_g, svh_g, H, I, 0, 1, gu_rs };
+        L.ex[e].u = { b + size_t(I / 16) * TILE_BYTES, suh_u, svh_u, H, I, 0, 1, gu_rs };
+        L.ex[e].d = { b + gu, suh_d, svh_d, I, H, 0, 1, d_rs };
+    }
+    return true;
+}
 
 void* big_alloc(size_t bytes)
 {
@@ -721,23 +830,44 @@ void moe_forward(Pool& pool, const Layer& L, const float* x, int ntok, const std
 // of one matrix = one contiguous 98 KB (gate/up) / 196 KB (down) run, so the single native pinned
 // copy that the GPU cache / zero-copy / staging paths use streams as fast as a re-laid-out copy.
 // Partial sums per band are reduced in the next phase (fused with the output transforms).
+// Also reads planar Mats (exl3xpu blob rows: 8 runs of 12 KB for gate / up, 24 KB for down).
+// I16 (mode 2) is bit-identical to moe_forward: a band is one 128-row scale block, its int32 lane sums are exact,
+// and reduce_bands applies the block scales with the same fma chain, from zero, in the same block order as
+// gemv_block_i16; the output fixups and the weighted sum keep moe_forward's expressions and order. AFFINE / EXACT
+// partial sums re-associate fp32 adds (not bit-identical).
 // ------------------------------------------------------------------------------------------
 
 // Rows [tk0, tk0+8) for all n, row-sequential (each row = one contiguous tiles_n*96 B run). The
 // 8-lane accumulators go straight to the caller's partial buffer, layout [tile][c][M][8] (fp32; int32
 // for I16), un-reduced: bands are summed as vectors and lane-reduced once, in the next phase.
-template <int M, bool EXACT>
+template <int M, bool EXACT, bool PL = false>
 void gemv_band(const Mat& mat, int tk0, const float* const* xp, float* acc)
 {
     const Consts K = consts();
     const int tiles_n = mat.n / 16;
-    const size_t row_stride = size_t(tiles_n) * TILE_BYTES;
+    const size_t row_stride = PL ? mat.rs : size_t(tiles_n) * TILE_BYTES;
     std::memset(acc, 0, size_t(tiles_n) * 64 * M * 4);
     const float* X[M];
     const uint8_t* p = mat.tr + size_t(tk0) * row_stride;
+    alignas(64) uint8_t tb[4 * TILE_BYTES];
     for (int r = 0; r < 8; ++r, p += row_stride)
     {
         for (int i = 0; i < M; ++i) X[i] = xp[i] + size_t(tk0 + r) * 32;
+        if constexpr (PL)
+        {
+            // one PLANAR4 group (4 tiles, 384 contiguous bytes) at a time
+            #pragma GCC unroll 1
+            for (int t = 0; t < tiles_n; t += 4)
+            {
+                const char* pf = reinterpret_cast<const char*>(p + t * TILE_BYTES + 2 * row_stride);
+                #pragma GCC unroll 6
+                for (int l = 0; l < 6; ++l) _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+                deplanar4(p + t * TILE_BYTES, tb);
+                #pragma GCC unroll 1
+                for (int j = 0; j < 4; ++j) tile_accum<M, EXACT>(tb + j * TILE_BYTES, X, acc + size_t(t + j) * 64 * M, K);
+            }
+            continue;
+        }
         #pragma GCC unroll 1
         for (int t = 0; t < tiles_n; ++t)
         {
@@ -748,18 +878,33 @@ void gemv_band(const Mat& mat, int tk0, const float* const* xp, float* acc)
     }
 }
 
-template <int M>
+template <int M, bool PL = false>
 void gemv_band_i16(const Mat& mat, int tk0, const int32_t* const* xq, int32_t* acc)
 {
     const Consts K = consts();
     const int tiles_n = mat.n / 16;
-    const size_t row_stride = size_t(tiles_n) * TILE_BYTES;
+    const size_t row_stride = PL ? mat.rs : size_t(tiles_n) * TILE_BYTES;
     std::memset(acc, 0, size_t(tiles_n) * 64 * M * 4);
     const int32_t* X[M];
     const uint8_t* p = mat.tr + size_t(tk0) * row_stride;
+    alignas(64) uint8_t tb[4 * TILE_BYTES];
     for (int r = 0; r < 8; ++r, p += row_stride)
     {
         for (int i = 0; i < M; ++i) X[i] = xq[i] + size_t(tk0 + r) * 32;
+        if constexpr (PL)
+        {
+            #pragma GCC unroll 1
+            for (int t = 0; t < tiles_n; t += 4)
+            {
+                const char* pf = reinterpret_cast<const char*>(p + t * TILE_BYTES + 2 * row_stride);
+                #pragma GCC unroll 6
+                for (int l = 0; l < 6; ++l) _mm_prefetch(pf + l * 64, _MM_HINT_T0);
+                deplanar4(p + t * TILE_BYTES, tb);
+                #pragma GCC unroll 1
+                for (int j = 0; j < 4; ++j) tile_accum_i16<M>(tb + j * TILE_BYTES, X, acc + size_t(t + j) * 64 * M, K);
+            }
+            continue;
+        }
         #pragma GCC unroll 1
         for (int t = 0; t < tiles_n; ++t)
         {
@@ -772,11 +917,16 @@ void gemv_band_i16(const Mat& mat, int tk0, const int32_t* const* xq, int32_t* a
 
 void gemv_band_m(int mode, int m, const Mat& mat, int tk0, const float* const* xp, float* acc)
 {
-#define FT_CASE(MM) case MM: \
-    if (mode == 1) gemv_band<MM, true>(mat, tk0, xp, acc); \
-    else if (mode == 0) gemv_band<MM, false>(mat, tk0, xp, acc); \
-    else gemv_band_i16<MM>(mat, tk0, reinterpret_cast<const int32_t* const*>(xp), reinterpret_cast<int32_t*>(acc)); break;
-    switch (m) { FT_CASE(1) FT_CASE(2) FT_CASE(3) FT_CASE(4) FT_CASE(5) FT_CASE(6) FT_CASE(7) default: FT_CASE(8) }
+#define FT_CASE(MM, PL) case MM: \
+    if (mode == 1) gemv_band<MM, true, PL>(mat, tk0, xp, acc); \
+    else if (mode == 0) gemv_band<MM, false, PL>(mat, tk0, xp, acc); \
+    else gemv_band_i16<MM, PL>(mat, tk0, reinterpret_cast<const int32_t* const*>(xp), reinterpret_cast<int32_t*>(acc)); break;
+    if (mat.planar)
+    {
+        switch (m) { FT_CASE(1, true) FT_CASE(2, true) FT_CASE(3, true) FT_CASE(4, true) FT_CASE(5, true) FT_CASE(6, true) FT_CASE(7, true) default: FT_CASE(8, true) }
+        return;
+    }
+    switch (m) { FT_CASE(1, false) FT_CASE(2, false) FT_CASE(3, false) FT_CASE(4, false) FT_CASE(5, false) FT_CASE(6, false) FT_CASE(7, false) default: FT_CASE(8, false) }
 #undef FT_CASE
 }
 

@@ -15,7 +15,7 @@ S=$(python3 -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
 SG=$S/sglang/srt
 
 mkdir -p "$OPT/ftx" "$BUILD" "$MOE"
-cp "$SRC"/opt/glm_opt.py "$SRC"/opt/ftx_tier.py "$SRC"/opt/mhc_triton.py "$SRC"/opt/pp_host.py "$OPT/"
+cp "$SRC"/opt/glm_opt.py "$SRC"/opt/ftx_tier.py "$SRC"/opt/mhc_triton.py "$SRC"/opt/pp_host.py "$SRC"/opt/test_ftx_usm.py "$OPT/"
 cp "$SRC"/ftx/ft_xpu.sycl "$SRC"/ftx/ft_tier_ext.cpp "$SRC"/ftx/ft_core.h "$OPT/ftx/"
 cp "$SRC"/opt/zz_glm_opt.pth "$S/zz_glm_opt.pth"
 
