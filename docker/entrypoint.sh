@@ -109,7 +109,10 @@ PORT=${PORT:-30000}
 command -v nvidia-smi >/dev/null && timeout 20 nvidia-smi -L >&2 || die "no NVIDIA GPU visible (run with --gpus)"
 NG=$(timeout 20 nvidia-smi -L | wc -l)
 [ "$NG" -eq 1 ] || log "WARNING: $NG GPUs visible; this build serves on ONE GPU (pass --gpus '\"device=N\"')"
-VRAM=$(timeout 20 nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
+# Read all lines, then keep the first. With `| head -1` under pipefail, head can exit before nvidia-smi has written
+# the second GPU's line; nvidia-smi then dies of SIGPIPE (141) and set -e kills the entrypoint.
+VRAM_ALL=$(timeout 20 nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits)
+VRAM=${VRAM_ALL%%$'\n'*}
 [ "${VRAM:-0}" -ge 23000 ] || die "GPU has ${VRAM} MiB; the measured configuration needs a 24 GB card"
 
 ML=$(ulimit -l)
