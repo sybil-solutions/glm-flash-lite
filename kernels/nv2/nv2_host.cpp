@@ -42,6 +42,7 @@ static inline void cpu_moe_forward(Pool& pool, const Layer& L, const float* x, i
 #include "nv2_shared.h"
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 using namespace nv2s;
 void dev_bind(pybind11::module& m);
@@ -75,6 +76,12 @@ struct Reader
     std::deque<Piece> hi, lo;
     bool quit = false;
     std::atomic<long> recs{0}, pieces{0};
+    // optional second copy of the store (GLM53_NV_STORE2, byte-identical, other drive): each piece read goes to the
+    // drive with fewer preads in flight
+    int fd_pri = -1, fd2 = -1;
+    std::atomic<int> infl[2] = { {0}, {0} };
+    std::atomic<unsigned> rr{0};
+    std::atomic<long> npd[2] = { {0}, {0} };
     void start(int n, std::vector<int> cpus)
     {
         for (int i = 0; i < n; ++i) th.emplace_back([this, cpus] { pin_self_set(cpus); loop(); });
@@ -104,13 +111,22 @@ struct Reader
                 if (!hi.empty()) { p = hi.front(); hi.pop_front(); } else { p = lo.front(); lo.pop_front(); }
             }
             int64_t done = 0; int err = 0;
+            int use_fd = p.fd, dsel = -1;
+            if (fd2 >= 0 && p.fd == fd_pri)
+            {
+                const int a = infl[0].load(), b = infl[1].load();
+                dsel = a < b ? 0 : (b < a ? 1 : int(rr++ & 1u));
+                infl[dsel]++; npd[dsel]++;
+                use_fd = dsel ? fd2 : fd_pri;
+            }
             while (done < p.len)
             {
-                ssize_t r = pread(p.fd, (void*) (p.dst + done), size_t(p.len - done), off_t(p.off + done));
+                ssize_t r = pread(use_fd, (void*) (p.dst + done), size_t(p.len - done), off_t(p.off + done));
                 if (r < 0) { if (errno == EINTR) continue; err = errno; break; }
                 if (r == 0) { err = -1; break; }
                 done += r;
             }
+            if (dsel >= 0) infl[dsel]--;
             pieces++;
             if (err) p.tr->err = err;
             if (p.tr->left.fetch_sub(1) == 1)
@@ -901,6 +917,16 @@ void init(int64_t L, int64_t E, int64_t H, int64_t I, int64_t rec_bytes, int64_t
     e.ctl_cpu = int(ctl_cpu);
     std::vector<int> rc(reader_cpus.begin(), reader_cpus.end());
     e.wb_cpu = rc.empty() ? -1 : rc.back();
+    e.rd.fd_pri = e.fd;
+    if (const char* s2 = getenv("GLM53_NV_STORE2"); s2 && *s2)
+    {
+        int f2 = open(s2, O_RDONLY | O_DIRECT);
+        TORCH_CHECK(f2 >= 0, "nv2: cannot open GLM53_NV_STORE2 with O_DIRECT: ", s2);
+        struct stat a1, a2; TORCH_CHECK(fstat(e.fd, &a1) == 0 && fstat(f2, &a2) == 0 && a1.st_size == a2.st_size,
+                                        "nv2: GLM53_NV_STORE2 size differs from the primary store: ", s2);
+        e.rd.fd2 = f2;
+        fprintf(stderr, "[nv2] second store copy %s: reads go to the less busy drive\n", s2);
+    }
     e.rd.start(int(readers), rc);
     cudaStreamCreateWithFlags(&e.wb_stream, cudaStreamNonBlocking);
     e.vring_addr.assign(vring.data_ptr<int64_t>(), vring.data_ptr<int64_t>() + vring.numel());
