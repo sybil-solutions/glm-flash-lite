@@ -12,7 +12,8 @@ sys.path.insert(0, "/opt/glmopt")
 import ftx_tier  # noqa: E402
 t0 = time.time()
 h = ftx_tier._build_host()
-assert all(hasattr(h, n) for n in ("tier_init", "tier_add_layer", "tier_start", "tier_stats")), dir(h)
+assert all(hasattr(h, n) for n in ("tier_init", "tier_add_layer", "tier_start", "tier_stats", "tier_add_layer_usm",
+                                   "tier_validate")), dir(h)
 dt = time.time() - t0
 assert dt < 20, f"host extension took {dt:.0f}s: it was rebuilt instead of reused"
 

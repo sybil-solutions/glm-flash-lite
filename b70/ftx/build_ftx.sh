@@ -5,7 +5,9 @@
 #   2. ft_tier_host.so  host side (ft_tier_ext.cpp + ft_core.h, AVX2), built exactly the way ftx_tier._build_host()
 #                       builds it at run time (torch.utils.cpp_extension, -O3 -mavx2 -mfma -mf16c -march=znver3), into
 #                       FTX_BUILD so the server finds it up to date and does not recompile.
-# ft_tier_ext.cpp and ft_core.h are identical to kernels/cpu_avx2/ (glm-flash-lite main at 0bd10f3).
+# ft_tier_ext.cpp and ft_core.h are kernels/cpu_avx2/ (glm-flash-lite main at 0bd10f3) plus the FTX_SRC=usm path
+# (planar Mats on the GPU store's USM blobs, tier_add_layer_usm, tier_validate; branch b70-lowram). The default
+# FTX_SRC=ckpt path computes the same as before, but the source changed, so ft_tier_host.so has a new hash.
 #   KDIR       directory holding these sources and receiving _ftx.so; must be the path ftx_tier.py uses (/opt/glmopt/ftx)
 #   OPTDIR     directory holding ftx_tier.py (/opt/glmopt)
 #   FTX_BUILD  host extension build directory (/opt/glmopt-build/ct)
